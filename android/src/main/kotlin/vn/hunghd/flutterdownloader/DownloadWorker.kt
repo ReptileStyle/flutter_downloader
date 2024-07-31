@@ -50,6 +50,7 @@ import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
+import vn.hunghd.flutterdownloader.*
 
 class DownloadWorker(context: Context, params: WorkerParameters) :
     Worker(context, params),
@@ -170,9 +171,9 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         val task = taskDao?.loadTask(id.toString())
         log(
             "DownloadWorker{url=$url,filename=$filename,savedDir=$savedDir,header=$headers,isResume=$isResume,status=" + (
-                task?.status
-                    ?: "GONE"
-                )
+                    task?.status
+                        ?: "GONE"
+                    )
         )
 
         // Task has been deleted or cancelled
@@ -261,7 +262,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
     ) {
         var actualFilename = filename
         var url = fileURL
-        var resourceUrl: URL
+        var resourceUrl: URL? = null
         var base: URL?
         var next: URL
         val visited: MutableMap<String, Int>
@@ -270,7 +271,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         var outputStream: OutputStream? = null
         var location: String
         var downloadedBytes: Long = 0
-        var responseCode: Int
+        var responseCode: Int = HttpURLConnection.HTTP_OK
         var times: Int
         visited = HashMap()
         try {
@@ -279,8 +280,11 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 lastProgress = task.progress
             }
 
-            // handle redirection logic
-            while (true) {
+            // Check if the URL is a local file URI
+            val isLocalFile = url.startsWith("file://")
+
+            // Handle redirection logic for remote URLs
+            while (!isLocalFile) {
                 if (!visited.containsKey(url)) {
                     times = 1
                     visited[url] = times
@@ -312,9 +316,10 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 httpConn.instanceFollowRedirects = false // Make the logic below easier to detect redirections
                 httpConn.setRequestProperty("User-Agent", "Mozilla/5.0...")
 
-                // setup request headers if it is set
+                // Setup request headers if set
                 setupHeaders(httpConn, headers)
-                // try to continue downloading a file from its partial downloaded data.
+
+                // Try to continue downloading a file from its partial downloaded data
                 if (isResume) {
                     downloadedBytes = setupPartialDownloadedDataHeader(httpConn, actualFilename, savedDir)
                 }
@@ -337,141 +342,130 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 }
                 break
             }
-            httpConn!!.connect()
-            val contentType: String?
-            if ((responseCode == HttpURLConnection.HTTP_OK || isResume && responseCode == HttpURLConnection.HTTP_PARTIAL) && !isStopped) {
-                contentType = httpConn.contentType
-                val contentLength: Long =
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) httpConn.contentLengthLong else httpConn.contentLength.toLong()
-                if (contentType != null) {
-                    log("Content-Type = $contentType")
-                }
-                log("Content-Length = $contentLength")
-                val charset = getCharsetFromContentType(contentType)
-                log("Charset = $charset")
-                if (!isResume) {
-                    // try to extract filename from HTTP headers if it is not given by user
-                    if (actualFilename == null) {
-                        val disposition: String? = httpConn.getHeaderField("Content-Disposition")
-                        log("Content-Disposition = $disposition")
-                        if (!disposition.isNullOrEmpty()) {
-                            actualFilename = getFileNameFromContentDisposition(disposition, charset)
-                        }
-                        if (actualFilename.isNullOrEmpty()) {
-                            actualFilename = url.substring(url.lastIndexOf("/") + 1)
-                            try {
-                                actualFilename = URLDecoder.decode(actualFilename, "UTF-8")
-                            } catch (e: IllegalArgumentException) {
-                                /* ok, just let filename be not encoded */
-                                e.printStackTrace()
-                            }
-                        }
-                    }
-                }
-                log("fileName = $actualFilename")
-                taskDao?.updateTask(id.toString(), actualFilename, contentType)
 
-                // opens input stream from the HTTP connection
-                inputStream = httpConn.inputStream
-                val savedFilePath: String?
-                // opens an output stream to save into file
-                // there are two case:
-                if (isResume) {
-                    // 1. continue downloading (append data to partial downloaded file)
-                    savedFilePath = savedDir + File.separator + actualFilename
-                    outputStream = FileOutputStream(savedFilePath, true)
-                } else {
-                    // 2. new download, create new file
-                    // there are two case according to Android SDK version and save path
-                    // From Android 11 onwards, file is only downloaded to app-specific directory (internal storage)
-                    // or public shared download directory (external storage).
-                    // The second option will ignore `savedDir` parameter.
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
-                        val uri = createFileInPublicDownloadsDir(actualFilename, contentType)
-                        savedFilePath = getMediaStoreEntryPathApi29(uri!!)
-                        outputStream = context.contentResolver.openOutputStream(uri, "w")
-                    } else {
-                        val file = createFileInAppSpecificDir(actualFilename!!, savedDir)
-                        savedFilePath = file!!.path
-                        outputStream = FileOutputStream(file, false)
-                    }
-                }
-                var count = downloadedBytes
-                var bytesRead: Int
-                val buffer = ByteArray(BUFFER_SIZE)
-                // using isStopped to monitor canceling task
-                while (inputStream.read(buffer).also { bytesRead = it } != -1 && !isStopped) {
-                    count += bytesRead.toLong()
-                    val progress = (count * 100 / (contentLength + downloadedBytes)).toInt()
-                    outputStream?.write(buffer, 0, bytesRead)
-                    if ((lastProgress == 0 || progress > lastProgress + step || progress == 100) &&
-                        progress != lastProgress
-                    ) {
-                        lastProgress = progress
-
-                        // This line possibly causes system overloaded because of accessing to DB too many ?!!!
-                        // but commenting this line causes tasks loaded from DB missing current downloading progress,
-                        // however, this missing data should be temporary and it will be updated as soon as
-                        // a new bunch of data fetched and a notification sent
-                        taskDao!!.updateTask(id.toString(), DownloadStatus.RUNNING, progress)
-                        updateNotification(
-                            context,
-                            actualFilename,
-                            DownloadStatus.RUNNING,
-                            progress,
-                            null,
-                            false
-                        )
-                    }
-                }
-                val loadedTask = taskDao?.loadTask(id.toString())
-                val progress = if (isStopped && loadedTask!!.resumable) lastProgress else 100
-                val status =
-                    if (isStopped) if (loadedTask!!.resumable) DownloadStatus.PAUSED else DownloadStatus.CANCELED else DownloadStatus.COMPLETE
-                val storage: Int = ContextCompat.checkSelfPermission(
-                    applicationContext,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE
-                )
-                var pendingIntent: PendingIntent? = null
-                if (status == DownloadStatus.COMPLETE) {
-                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-                        if (isImageOrVideoFile(contentType) && isExternalStoragePath(savedFilePath)) {
-                            addImageOrVideoToGallery(
-                                actualFilename,
-                                savedFilePath,
-                                getContentTypeWithoutCharset(contentType)
-                            )
-                        }
-                    }
-                    if (clickToOpenDownloadedFile) {
-                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && storage != PackageManager.PERMISSION_GRANTED) return
-                        val intent = IntentUtils.validatedFileIntent(
-                            applicationContext,
-                            savedFilePath!!,
-                            contentType
-                        )
-                        if (intent != null) {
-                            log("Setting an intent to open the file $savedFilePath")
-                            val flags: Int =
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE else PendingIntent.FLAG_CANCEL_CURRENT
-                            pendingIntent =
-                                PendingIntent.getActivity(applicationContext, 0, intent, flags)
-                        } else {
-                            log("There's no application that can open the file $savedFilePath")
-                        }
-                    }
-                }
-                taskDao!!.updateTask(id.toString(), status, progress)
-                updateNotification(context, actualFilename, status, progress, pendingIntent, true)
-                log(if (isStopped) "Download canceled" else "File downloaded")
+            if (isLocalFile) {
+                // Handle local file URI
+                val uri = Uri.parse(url)
+                inputStream = context.contentResolver.openInputStream(uri)
             } else {
-                val loadedTask = taskDao!!.loadTask(id.toString())
-                val status =
-                    if (isStopped) if (loadedTask!!.resumable) DownloadStatus.PAUSED else DownloadStatus.CANCELED else DownloadStatus.FAILED
-                taskDao!!.updateTask(id.toString(), status, lastProgress)
-                updateNotification(context, actualFilename ?: fileURL, status, -1, null, true)
-                log(if (isStopped) "Download canceled" else "Server replied HTTP code: $responseCode")
+                // Handle remote URL
+                httpConn!!.connect()
+                if ((responseCode == HttpURLConnection.HTTP_OK || isResume && responseCode == HttpURLConnection.HTTP_PARTIAL) && !isStopped) {
+                    inputStream = httpConn.inputStream
+                } else {
+                    throw IOException("Server replied HTTP code: $responseCode")
+                }
             }
+
+            val contentType: String? = httpConn?.contentType
+            val contentLength: Long =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) httpConn?.contentLengthLong ?: 0L else httpConn?.contentLength?.toLong() ?: 0L
+            if (contentType != null) {
+                log("Content-Type = $contentType")
+            }
+            log("Content-Length = $contentLength")
+            val charset = getCharsetFromContentType(contentType)
+            log("Charset = $charset")
+            if (!isResume) {
+                // Try to extract filename from HTTP headers if it is not given by user
+                if (actualFilename == null) {
+                    val disposition: String? = httpConn?.getHeaderField("Content-Disposition")
+                    log("Content-Disposition = $disposition")
+                    if (!disposition.isNullOrEmpty()) {
+                        actualFilename = getFileNameFromContentDisposition(disposition, charset)
+                    }
+                    if (actualFilename.isNullOrEmpty()) {
+                        actualFilename = url.substring(url.lastIndexOf("/") + 1)
+                        try {
+                            actualFilename = URLDecoder.decode(actualFilename, "UTF-8")
+                        } catch (e: IllegalArgumentException) {
+                            /* ok, just let filename be not encoded */
+                            e.printStackTrace()
+                        }
+                    }
+                }
+            }
+            log("fileName = $actualFilename")
+            taskDao?.updateTask(id.toString(), actualFilename, contentType)
+
+            val savedFilePath: String?
+            // Opens an output stream to save into file
+            if (isResume) {
+                // Continue downloading (append data to partial downloaded file)
+                savedFilePath = savedDir + File.separator + actualFilename
+                outputStream = FileOutputStream(savedFilePath, true)
+            } else {
+                // New download, create new file
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
+                    val uri = createFileInPublicDownloadsDir(actualFilename, contentType)
+                    savedFilePath = getMediaStoreEntryPathApi29(uri!!)
+                    outputStream = context.contentResolver.openOutputStream(uri, "w")
+                } else {
+                    val file = createFileInAppSpecificDir(actualFilename!!, savedDir)
+                    savedFilePath = file!!.path
+                    outputStream = FileOutputStream(file, false)
+                }
+            }
+
+            var count = downloadedBytes
+            var bytesRead: Int
+            val buffer = ByteArray(BUFFER_SIZE)
+            // Using isStopped to monitor canceling task
+            while (inputStream!!.read(buffer).also { bytesRead = it } != -1 && !isStopped) {
+                count += bytesRead.toLong()
+                val progress = if (isLocalFile) 100 else (count * 100 / (contentLength + downloadedBytes)).toInt()
+                outputStream?.write(buffer, 0, bytesRead)
+                if ((lastProgress == 0 || progress > lastProgress + step || progress == 100) && progress != lastProgress) {
+                    lastProgress = progress
+                    taskDao!!.updateTask(id.toString(), DownloadStatus.RUNNING, progress)
+                    updateNotification(
+                        context,
+                        actualFilename,
+                        DownloadStatus.RUNNING,
+                        progress,
+                        null,
+                        false
+                    )
+                }
+            }
+            val loadedTask = taskDao?.loadTask(id.toString())
+            val progress = if (isStopped && loadedTask!!.resumable) lastProgress else 100
+            val status = if (isStopped) if (loadedTask!!.resumable) DownloadStatus.PAUSED else DownloadStatus.CANCELED else DownloadStatus.COMPLETE
+            val storage: Int = ContextCompat.checkSelfPermission(
+                applicationContext,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            )
+            var pendingIntent: PendingIntent? = null
+            if (status == DownloadStatus.COMPLETE) {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                    if (isImageOrVideoFile(contentType) && isExternalStoragePath(savedFilePath)) {
+                        addImageOrVideoToGallery(
+                            actualFilename,
+                            savedFilePath,
+                            getContentTypeWithoutCharset(contentType)
+                        )
+                    }
+                }
+                if (clickToOpenDownloadedFile) {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && storage != PackageManager.PERMISSION_GRANTED) return
+                    val intent = IntentUtils.validatedFileIntent(
+                        applicationContext,
+                        savedFilePath!!,
+                        contentType
+                    )
+                    if (intent != null) {
+                        log("Setting an intent to open the file $savedFilePath")
+                        val flags: Int =
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE else PendingIntent.FLAG_CANCEL_CURRENT
+                        pendingIntent = PendingIntent.getActivity(applicationContext, 0, intent, flags)
+                    } else {
+                        log("There's no application that can open the file $savedFilePath")
+                    }
+                }
+            }
+            taskDao!!.updateTask(id.toString(), status, progress)
+            updateNotification(context, actualFilename, status, progress, pendingIntent, true)
+            log(if (isStopped) "Download canceled" else "File downloaded")
         } catch (e: IOException) {
             taskDao!!.updateTask(id.toString(), DownloadStatus.FAILED, lastProgress)
             updateNotification(context, actualFilename ?: fileURL, DownloadStatus.FAILED, -1, null, true)

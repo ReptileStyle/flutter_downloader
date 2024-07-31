@@ -16,12 +16,21 @@ object IntentUtils {
     private fun buildIntent(context: Context, file: File, mime: String?): Intent {
         val intent = Intent(Intent.ACTION_VIEW)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            val uri = FileProvider.getUriForFile(
-                context,
-                context.packageName + ".flutter_downloader.provider",
-                file
-            )
-            intent.setDataAndType(uri, mime)
+            try {
+                val uri = FileProvider.getUriForFile(
+                    context,
+                    context.packageName + ".flutter_downloader.provider",
+                    file
+                )
+                intent.setDataAndType(uri, mime)
+            } catch (e: Exception) {
+                val uri = FileProvider.getUriForFile(
+                    context,
+                    context.packageName,
+                    file
+                )
+                intent.setDataAndType(uri, mime)
+            }
         } else {
             intent.setDataAndType(Uri.fromFile(file), mime)
         }
